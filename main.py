@@ -54,6 +54,11 @@ get_hms = lambda action: _now(action).strftime("%H:%M:%S")
 get_current_dayofweek = lambda action: _now(action).strftime("%A")
 
 
+def _format_seat_number(seat_num: int) -> str:
+    """将座位号格式化为三位数字符串，如 1 -> '001', 43 -> '043'"""
+    return f"{seat_num:03d}"
+
+
 SLEEPTIME = 0.1  # 每次抢座的间隔（减少到0.05秒以加快速度）
 ENDTIME = "20:00:40"  # 根据学校的预约座位时间+1min即可
 
@@ -515,13 +520,29 @@ def main(users, action=False):
                 users, usernames, passwords, action, target_dt, success_list
             )
             strategic_done = True
+
+            # 预热三次结束后，如果仍有配置未成功，自动递增座位号并立即继续尝试
+            if success_list is not None and sum(success_list) < today_reservation_num:
+                seat_offset = 1
+                for i, user in enumerate(users):
+                    if not success_list[i] and original_seatids[i] is not None:
+                        new_seat = _format_seat_number(original_seatids[i] + seat_offset)
+                        user["seatid"] = [new_seat]
+                        logging.info(
+                            f"[seat-increment-after-strategic] Config {i}: try seat {new_seat} "
+                            f"(base {original_seatids[i]} + offset {seat_offset})"
+                        )
+                # 递增座位后立即调用 login_and_reserve
+                success_list = login_and_reserve(
+                    users, usernames, passwords, action, success_list, sessions
+                )
         else:
             # 预热结束后仍未成功：未成功配置按座位号 +1 继续尝试（每轮 +1）
             if success_list is not None and sum(success_list) < today_reservation_num:
                 seat_offset += 1
                 for i, user in enumerate(users):
                     if not success_list[i] and original_seatids[i] is not None:
-                        new_seat = str(original_seatids[i] + seat_offset)
+                        new_seat = _format_seat_number(original_seatids[i] + seat_offset)
                         user["seatid"] = [new_seat]
                         logging.info(
                             f"[seat-increment] Config {i}: try seat {new_seat} "
