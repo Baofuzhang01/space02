@@ -157,5 +157,6 @@ workers/**/node_modules/
 # 验证码调试目录
 captcha_debug/
 
-# 本地配置（包含敏感信息，示例配置保留）
-# config.json  # 如包含真实账号密码，取消此行注释
+# 本地配置（包含敏感信息）
+config.json
+utils/config.json
