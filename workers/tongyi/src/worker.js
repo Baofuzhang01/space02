@@ -140,11 +140,8 @@ function defaultSchool(id, name) {
       slider_lead_seconds: 10,
       pre_fetch_token_ms: 1531,
       first_submit_offset_ms: 9,
-      first_submit_offset_range_ms: [9, 9],
       target_offset2_ms: 24,
-      target_offset2_range_ms: [24, 24],
       target_offset3_ms: 140,
-      target_offset3_range_ms: [140, 140],
       token_fetch_delay_ms: 45,
       token_fetch_delay_range_ms: [45, 45],
       burst_offsets_ms: [120, 420, 820],
@@ -341,15 +338,9 @@ function parseRangeWithFallback(v, fallback) {
 
 function randomizeStrategy(base) {
   const s = { ...(base || {}) };
-  const firstRange = parseRangeWithFallback(s.first_submit_offset_range_ms, s.first_submit_offset_ms || 9);
-  const secondRange = parseRangeWithFallback(s.target_offset2_range_ms, s.target_offset2_ms || 24);
-  const thirdRange = parseRangeWithFallback(s.target_offset3_range_ms, s.target_offset3_ms || 140);
   const tokenRange = parseRangeWithFallback(s.token_fetch_delay_range_ms, s.token_fetch_delay_ms || 45);
   const burstJitterRange = parseRangeWithFallback(s.burst_jitter_range_ms, 0);
 
-  s.first_submit_offset_ms = randIntInclusive(firstRange[0], firstRange[1]);
-  s.target_offset2_ms = randIntInclusive(secondRange[0], secondRange[1]);
-  s.target_offset3_ms = randIntInclusive(thirdRange[0], thirdRange[1]);
   s.token_fetch_delay_ms = randIntInclusive(tokenRange[0], tokenRange[1]);
 
   const baseBurst = Array.isArray(s.burst_offsets_ms) ? s.burst_offsets_ms : [120, 420, 820];
@@ -1163,30 +1154,16 @@ function renderEditSchoolModal() {
           </div>
           <div class="form-row">
             <div class="form-group">
-              <label>首枪随机范围（first_submit_offset_range_ms）</label>
-              <input type="text" id="edit_strategy_first_range" value="\${(st.first_submit_offset_range_ms || [st.first_submit_offset_ms || 9, st.first_submit_offset_ms || 9]).join(',')}" placeholder="例如: 6,18">
-            </div>
-            <div class="form-group">
-              <label>第二枪随机范围（target_offset2_range_ms）</label>
-              <input type="text" id="edit_strategy_target2_range" value="\${(st.target_offset2_range_ms || [st.target_offset2_ms || 24, st.target_offset2_ms || 24]).join(',')}" placeholder="例如: 20,60">
-            </div>
-          </div>
-          <div class="form-row">
-            <div class="form-group">
-              <label>第三枪随机范围（target_offset3_range_ms）</label>
-              <input type="text" id="edit_strategy_target3_range" value="\${(st.target_offset3_range_ms || [st.target_offset3_ms || 140, st.target_offset3_ms || 140]).join(',')}" placeholder="例如: 100,220">
-            </div>
-            <div class="form-group">
               <label>取 token 随机范围（token_fetch_delay_range_ms）</label>
               <input type="text" id="edit_strategy_delay_range" value="\${(st.token_fetch_delay_range_ms || [st.token_fetch_delay_ms || 45, st.token_fetch_delay_ms || 45]).join(',')}" placeholder="例如: 20,80">
             </div>
-          </div>
-          <div class="form-group">
-            <label>burst 抖动范围（burst_jitter_range_ms）</label>
-            <input type="text" id="edit_strategy_burst_jitter" value="\${(st.burst_jitter_range_ms || [0,0]).join(',')}" placeholder="例如: -30,30（会加到每个 burst 偏移）">
+            <div class="form-group">
+              <label>burst_offsets_ms 抖动范围（burst_jitter_range_ms）</label>
+              <input type="text" id="edit_strategy_burst_jitter" value="\${(st.burst_jitter_range_ms || [0,0]).join(',')}" placeholder="例如: -30,30（会加到每个 burst 偏移）">
+            </div>
           </div>
           <div style="font-size:12px;color:#666;margin-top:6px">
-            说明：范围统一用 min,max（英文逗号）。每个用户触发时会在范围内随机生成自己的偏移值。
+            说明：仅 token_fetch_delay_ms 与 burst_offsets_ms 支持范围随机；其余偏移使用固定值。
           </div>
           <button class="btn btn-primary" onclick="doEditSchool()" style="width:100%;margin-top:16px">保存配置</button>
           <button class="btn btn-danger" onclick="doDeleteSchool()" style="width:100%;margin-top:8px">删除学校</button>
@@ -1354,9 +1331,6 @@ async function doEditSchool() {
     if (arr.length >= 2) return [arr[0], arr[1]];
     return [fallbackA, fallbackB];
   };
-  const firstRange = parseRangeInput("edit_strategy_first_range", 9, 9);
-  const target2Range = parseRangeInput("edit_strategy_target2_range", 24, 24);
-  const target3Range = parseRangeInput("edit_strategy_target3_range", 140, 140);
   const delayRange = parseRangeInput("edit_strategy_delay_range", 45, 45);
   const burstJitterRange = parseRangeInput("edit_strategy_burst_jitter", 0, 0);
   const body = {
@@ -1373,11 +1347,8 @@ async function doEditSchool() {
       slider_lead_seconds: parseInt(document.getElementById("edit_strategy_slider").value) || 10,
       pre_fetch_token_ms: parseInt(document.getElementById("edit_strategy_prefetch").value) || 1531,
       first_submit_offset_ms: parseInt(document.getElementById("edit_strategy_first").value) || 9,
-      first_submit_offset_range_ms: firstRange,
       target_offset2_ms: parseInt(document.getElementById("edit_strategy_target2").value) || 24,
-      target_offset2_range_ms: target2Range,
       target_offset3_ms: parseInt(document.getElementById("edit_strategy_target3").value) || 140,
-      target_offset3_range_ms: target3Range,
       token_fetch_delay_ms: parseInt(document.getElementById("edit_strategy_delay").value) || 45,
       token_fetch_delay_range_ms: delayRange,
       burst_offsets_ms: burstOffsets.length ? burstOffsets : [120, 420, 820],
