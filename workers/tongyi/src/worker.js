@@ -569,9 +569,9 @@ async function findSeatConflicts(KV, schoolId, schedule, excludeUserId = "") {
     if (excludeUserId && uid === excludeUserId) continue;
 
     const existingUser = await getUser(KV, schoolId, uid);
-    if (!existingUser || existingUser.status !== "active") continue;
+    if (!existingUser) continue;
 
-    const owner = existingUser.remark || existingUser.username || existingUser.phone || uid;
+    const owner = existingUser.username || "(无昵称)";
     const existingEntries = collectScheduleSeatEntries(existingUser.schedule || {});
     for (const entry of existingEntries) {
       const key = `${entry.day}|${entry.roomid}|${entry.seat}`;
@@ -591,7 +591,7 @@ async function findSeatConflicts(KV, schoolId, schedule, excludeUserId = "") {
     const key = `${incoming.day}|${incoming.roomid}|${incoming.seat}`;
     const occupied = existingByKey.get(key) || [];
     for (const existing of occupied) {
-      if (!isTimeOverlapped(incoming.times, existing.times)) continue;
+      // 只要同一天、同房间、同座位就算冲突，不判断时间段
       conflicts.push({
         day: incoming.day,
         roomid: incoming.roomid,
@@ -611,10 +611,10 @@ async function findSeatConflicts(KV, schoolId, schedule, excludeUserId = "") {
 function buildSeatConflictError(conflicts) {
   if (!conflicts.length) return "";
   const preview = conflicts.slice(0, 3).map(c => (
-    `${dayNameZh(c.day)} 房间${c.roomid} 座位${c.seatid} 时段${c.times} 已被 ${c.occupiedBy} 占用`
+    `${dayNameZh(c.day)} 房间${c.roomid} 座位${c.seatid} 时段${c.times} 已被用户“${c.occupiedBy}”占用`
   ));
   const suffix = conflicts.length > 3 ? `；另有 ${conflicts.length - 3} 条冲突` : "";
-  return `检测到座位冲突：${preview.join("；")}${suffix}`;
+  return `⚠️ 检测到座位冲突：${preview.join("；")}${suffix}`;
 }
 
 // ─── Scheduled Handler ───
@@ -1439,7 +1439,11 @@ function renderSchoolDetail() {
               </tr>
             </thead>
             <tbody>
-              \${users.map(u => {
+              \${users.slice().sort((a, b) => {
+                const na = (a.username || a.remark || "").toLowerCase();
+                const nb = (b.username || b.remark || "").toLowerCase();
+                return na.localeCompare(nb);
+              }).map(u => {
                 const today = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"][new Date().getDay()];
                 const todaySch = u.schedule[today];
                 const todayStr = (() => {
