@@ -164,7 +164,7 @@ def _apply_strategy_config(config):
 
     strategy_cfg = config.get("strategy", {})
     ENDTIME = config.get("endtime", ENDTIME)
-    STRATEGY_LOGIN_LEAD_SECONDS = int(strategy_cfg.get("login_lead_seconds", 18))
+    STRATEGY_LOGIN_LEAD_SECONDS = int(strategy_cfg.get("login_lead_seconds", 20))
     STRATEGY_SLIDER_LEAD_SECONDS = int(strategy_cfg.get("slider_lead_seconds", 14))
     STRATEGIC_MODE = strategy_cfg.get("mode", "B")
     PRE_FETCH_TOKEN_MS = int(strategy_cfg.get("pre_fetch_token_ms", 3000))
@@ -192,6 +192,24 @@ def _get_beijing_target_from_endtime() -> datetime.datetime:
     )
     return end_dt - datetime.timedelta(seconds=40)
     # return end_dt - datetime.timedelta(minutes=1)  # ENDTIME 前 1 分钟（60秒）
+
+
+def _get_strategy_login_deadline(target_dt: datetime.datetime) -> datetime.datetime:
+    """战略登录的最晚补救时刻。
+
+    目的不是无限等待登录，而是在前三枪仍然有意义的时间窗内继续补救。
+    超过该时刻后交给普通主循环处理，避免阻塞后续流程。
+    """
+    if SUBMIT_MODE == "burst":
+        max_offset_ms = max(BURST_OFFSETS_MS) if BURST_OFFSETS_MS else 0
+    else:
+        max_offset_ms = max(
+            FIRST_SUBMIT_OFFSET_MS,
+            TARGET_OFFSET2_MS,
+            TARGET_OFFSET3_MS,
+            TOKEN_FETCH_DELAY_MS,
+        )
+    return target_dt + datetime.timedelta(milliseconds=max_offset_ms + 500)
 
 def _burst_shot_worker(
     index, offset_ms, target_dt, s, token_url,
@@ -330,9 +348,37 @@ def strategic_first_attempt(
             enable_textclick=ENABLE_TEXTCLICK,
             reserve_next_day=RESERVE_NEXT_DAY,
         )
-        s.get_login_status()
-        s.login(username, password)
-        s.requests.headers.update({"Host": "office.chaoxing.com"})
+        login_deadline = _get_strategy_login_deadline(target_dt)
+        login_ok = False
+        while _beijing_now() < login_deadline:
+            # 战略阶段把“多次小步快跑”放到外层 deadline 循环里，
+            # 避免单次 bootstrap 的内部重试把整个首发窗口吃光。
+            if s.bootstrap_login(username, password, attempts=1):
+                login_ok = True
+                break
+
+            remaining_login_s = (login_deadline - _beijing_now()).total_seconds()
+            if remaining_login_s <= 0:
+                break
+
+            logging.warning(
+                f"[strategic] Login bootstrap failed for {username}, "
+                f"retry within strategic window for {remaining_login_s:.2f}s more"
+            )
+            time.sleep(min(0.2, remaining_login_s))
+
+        if not login_ok:
+            logging.warning(
+                f"[strategic] Skip first attempt for {username}: login bootstrap failed "
+                f"until strategic deadline {login_deadline}"
+            )
+            continue
+
+        if _beijing_now() >= target_dt:
+            logging.warning(
+                f"[strategic] Login for {username} recovered after target time; "
+                "continue strategic submits with reduced preheat budget"
+            )
         # 将已登录的 session 存入 sessions[]，fallback 直接复用，无需重新登录
         if sessions is not None and sessions[index] is None:
             sessions[index] = s
@@ -789,9 +835,11 @@ def login_and_reserve(
                         enable_textclick=ENABLE_TEXTCLICK,
                         reserve_next_day=RESERVE_NEXT_DAY,
                     )
-                    s.get_login_status()
-                    s.login(username, password)
-                    s.requests.headers.update({"Host": "office.chaoxing.com"})
+                    if not s.bootstrap_login(username, password):
+                        logging.warning(
+                            f"Skip current attempt for {username}: login bootstrap failed"
+                        )
+                        continue
                     sessions[index] = s
                 else:
                     # 复用已有会话，确保 Host 头正确
@@ -805,9 +853,11 @@ def login_and_reserve(
                     enable_textclick=ENABLE_TEXTCLICK,
                     reserve_next_day=RESERVE_NEXT_DAY,
                 )
-                s.get_login_status()
-                s.login(username, password)
-                s.requests.headers.update({"Host": "office.chaoxing.com"})
+                if not s.bootstrap_login(username, password):
+                    logging.warning(
+                        f"Skip current attempt for {username}: login bootstrap failed"
+                    )
+                    continue
 
             # 在 GitHub Actions 中传入 ENDTIME，确保内部循环在超过结束时间后及时停止
             suc = s.submit(
@@ -996,9 +1046,9 @@ def debug(users, action=False):
             enable_textclick=ENABLE_TEXTCLICK,
             reserve_next_day=RESERVE_NEXT_DAY,
         )
-        s.get_login_status()
-        s.login(username, password)
-        s.requests.headers.update({"Host": "office.chaoxing.com"})
+        if not s.bootstrap_login(username, password):
+            logging.warning(f"Skip debug reserve attempt for {username}: login bootstrap failed")
+            continue
         suc = s.submit(times, roomid, seatid, action, None, fidEnc=fid_enc, seat_page_id=seat_page_id)
         if suc:
             return
@@ -1014,9 +1064,9 @@ def get_roomid(args1, args2):
         enable_textclick=ENABLE_TEXTCLICK,
         reserve_next_day=RESERVE_NEXT_DAY,
     )
-    s.get_login_status()
-    s.login(username=username, password=password)
-    s.requests.headers.update({"Host": "office.chaoxing.com"})
+    if not s.bootstrap_login(username=username, password=password):
+        logging.error("Failed to bootstrap login session, abort room query")
+        return
     encode = input("请输入deptldEnc：")
     s.roomid(encode)
 

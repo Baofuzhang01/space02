@@ -16,9 +16,9 @@ except ImportError:
     pass  # dotenv not installed, use system environment variables instead
 
 
-    def _should_save_captcha_debug_images() -> bool:
-        """是否保存验证码图片到本地，默认关闭。"""
-        return os.getenv("SAVE_CAPTCHA_DEBUG_IMAGES", "0").lower() in {"1", "true", "yes", "on"}
+def _should_save_captcha_debug_images() -> bool:
+    """是否保存验证码图片到本地，默认关闭。"""
+    return os.getenv("SAVE_CAPTCHA_DEBUG_IMAGES", "0").lower() in {"1", "true", "yes", "on"}
 
 
 def _get_tulingcloud_config():
@@ -89,6 +89,12 @@ class reserve:
         self.fail_dict = []
         self.submit_msg = []
         self.requests = requests.session()
+        self.request_timeout = (
+            float(os.getenv("CX_CONNECT_TIMEOUT", "3.05")),
+            float(os.getenv("CX_READ_TIMEOUT", "5")),
+        )
+        self.request_attempts = max(1, int(os.getenv("CX_REQUEST_ATTEMPTS", "3")))
+        self.request_retry_delay = float(os.getenv("CX_REQUEST_RETRY_DELAY", "0.2"))
         self.headers = {
             "Referer": "https://office.chaoxing.com/",
             "Host": "captcha.chaoxing.com",
@@ -122,6 +128,48 @@ class reserve:
         self.reserve_next_day = reserve_next_day
         requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
+    def _request_with_retry(
+        self,
+        method,
+        url,
+        *,
+        request_name="request",
+        attempts=None,
+        retry_delay=None,
+        **kwargs,
+    ):
+        attempts = attempts if attempts is not None else self.request_attempts
+        retry_delay = (
+            retry_delay if retry_delay is not None else self.request_retry_delay
+        )
+        if "timeout" not in kwargs:
+            kwargs["timeout"] = self.request_timeout
+
+        last_exc = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return self.requests.request(method=method, url=url, **kwargs)
+            except requests.exceptions.RequestException as exc:
+                last_exc = exc
+                if attempt >= attempts:
+                    logging.error(
+                        f"{request_name} failed after {attempts} attempt(s): {exc}"
+                    )
+                    raise
+                logging.warning(
+                    f"{request_name} failed on attempt {attempt}/{attempts}: {exc}; "
+                    f"retrying in {retry_delay:.2f}s"
+                )
+                time.sleep(retry_delay)
+
+        raise last_exc
+
+    def _get(self, url, **kwargs):
+        return self._request_with_retry("GET", url, **kwargs)
+
+    def _post(self, url, **kwargs):
+        return self._request_with_retry("POST", url, **kwargs)
+
     # login and page token
     def _get_page_token(self, url, require_value: bool = False, method: str = "GET", data=None):
         """从页面提取提交用的 token。
@@ -136,10 +184,23 @@ class reserve:
             method: "GET" 或 "POST"，允许按前端实现切换请求方式
             data: 当使用 POST 时提交的表单数据
         """
-        if method.upper() == "POST":
-            response = self.requests.post(url=url, data=data or {}, verify=False)
-        else:
-            response = self.requests.get(url=url, verify=False)
+        try:
+            if method.upper() == "POST":
+                response = self._post(
+                    url=url,
+                    data=data or {},
+                    verify=False,
+                    request_name="seat page token fetch",
+                )
+            else:
+                response = self._get(
+                    url=url,
+                    verify=False,
+                    request_name="seat page token fetch",
+                )
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"Failed to fetch seat page token from {url}: {e}")
+            return "", ""
 
         # 统一按 UTF-8 解码，并忽略非法字符，避免 charset 识别错误导致正则匹配失败
         html = response.content.decode("utf-8", errors="ignore")
@@ -182,16 +243,27 @@ class reserve:
         跳过 TCP 三次握手 + TLS 协商，节省约 100-200ms。
         """
         try:
-            self.requests.get(url=url, verify=False, timeout=5)
+            self._get(
+                url=url,
+                verify=False,
+                timeout=5,
+                attempts=1,
+                request_name="[warm] connection pre-warm",
+            )
             logging.info(f"[warm] Connection pre-warmed via {url}")
         except Exception as e:
             logging.warning(f"[warm] Failed to warm connection: {e}")
 
-    def get_login_status(self):
+    def get_login_status(self, attempts=None):
         self.requests.headers = self.login_headers
-        self.requests.get(url=self.login_page, verify=False)
+        self._get(
+            url=self.login_page,
+            verify=False,
+            request_name="login page bootstrap",
+            attempts=attempts,
+        )
 
-    def login(self, username, password):
+    def login(self, username, password, attempts=None):
         username = AES_Encrypt(username)
         password = AES_Encrypt(password)
         parm = {
@@ -201,8 +273,18 @@ class reserve:
             "refer": "http%3A%2F%2Foffice.chaoxing.com%2Ffront%2Fthird%2Fapps%2Fseat%2Fcode%3Fid%3D4219%26seatNum%3D380",
             "t": True,
         }
-        jsons = self.requests.post(url=self.login_url, params=parm, verify=False)
-        obj = jsons.json()
+        response = self._post(
+            url=self.login_url,
+            params=parm,
+            verify=False,
+            request_name="Chaoxing login submit",
+            attempts=attempts,
+        )
+        try:
+            obj = response.json()
+        except ValueError as e:
+            logging.error(f"Failed to parse Chaoxing login response: {e}")
+            return (False, "invalid login response")
         if obj["status"]:
             logging.info(f"User {username} login successfully")
             return (True, "")
@@ -212,11 +294,31 @@ class reserve:
             )
             return (False, obj["msg2"])
 
+    def bootstrap_login(self, username, password, attempts=None):
+        """建立登录态；遇到短暂网络错误时返回 False，由外层继续调度。"""
+        try:
+            self.get_login_status(attempts=attempts)
+            success, msg = self.login(username, password, attempts=attempts)
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"Failed to bootstrap login session for {username}: {e}")
+            return False
+
+        if not success:
+            logging.warning(f"Login bootstrap rejected for {username}: {msg}")
+            return False
+
+        self.requests.headers.update({"Host": "office.chaoxing.com"})
+        return True
+
     # extra: get roomid
     def roomid(self, encode):
         url = f"https://office.chaoxing.com/data/apps/seat/room/list?cpage=1&pageSize=100&firstLevelName=&secondLevelName=&thirdLevelName=&deptIdEnc={encode}"
-        json_data = self.requests.get(url=url).content.decode("utf-8")
-        ori_data = json.loads(json_data)
+        json_data = self._get(url=url, request_name="room list fetch").content.decode("utf-8")
+        try:
+            ori_data = json.loads(json_data)
+        except ValueError as e:
+            logging.error(f"Failed to parse room list response: {e}")
+            return
         for i in ori_data["data"]["seatRoomList"]:
             info = f'{i["firstLevelName"]}-{i["secondLevelName"]}-{i["thirdLevelName"]} id为：{i["id"]}'
             print(info)
@@ -241,6 +343,9 @@ class reserve:
         """滑块验证码求解。"""
         logging.info(f"Start to resolve slide captcha token")
         captcha_token, bg, tp = self.get_slide_captcha_data()
+        if not captcha_token or not bg or not tp:
+            logging.warning("Failed to get slide captcha payload")
+            return ""
         logging.info(f"Successfully get prepared captcha_token {captcha_token}")
         logging.info(f"Captcha Image URL-small {tp}, URL-big {bg}")
         x = self.x_distance(bg, tp)
@@ -255,6 +360,9 @@ class reserve:
         """选字验证码求解。"""
         logging.info("Start to resolve textclick captcha token")
         captcha_token, image_url, target_text = self.get_textclick_captcha_data()
+        if not captcha_token or not image_url:
+            logging.warning("Failed to get textclick captcha payload")
+            return ""
         logging.info(f"Successfully get prepared captcha_token {captcha_token}")
         logging.info(f"Target text: {target_text}")
         
@@ -290,20 +398,29 @@ class reserve:
             "_": int(time.time() * 1000),
         }
         logging.debug(f"Submit captcha params: {params}")
-        response = self.requests.get(
-            f"https://captcha.chaoxing.com/captcha/check/verification/result",
-            params=params,
-            headers=self.headers,
-        )
+        try:
+            response = self._get(
+                f"https://captcha.chaoxing.com/captcha/check/verification/result",
+                params=params,
+                headers=self.headers,
+                request_name=f"{captcha_type} captcha submit",
+            )
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"Failed to submit {captcha_type} captcha: {e}")
+            return ""
         text = response.text.replace(
             "jQuery33109180509737430778_1716381333117(", ""
         ).replace(")", "")
-        data = json.loads(text)
+        try:
+            data = json.loads(text)
+        except ValueError as e:
+            logging.error(f"Failed to parse {captcha_type} captcha response: {e}")
+            return ""
         logging.info(f"Successfully resolve the captcha token: {data}")
         try:
             validate_val = json.loads(data["extraData"])["validate"]
             return validate_val
-        except KeyError as e:
+        except (KeyError, ValueError) as e:
             logging.info("Can't load validate value. Maybe server return mistake.")
             return ""
 
@@ -325,13 +442,26 @@ class reserve:
             "d": "a",
             "b": "a",
         }
-        response = self.requests.get(url=url, params=params, headers=self.headers)
+        try:
+            response = self._get(
+                url=url,
+                params=params,
+                headers=self.headers,
+                request_name="textclick captcha fetch",
+            )
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"Failed to fetch textclick captcha data: {e}")
+            return "", "", ""
         content = response.text
 
         data = content.replace(
             "jQuery33107685004390294206_1716461324846(", ""
         ).replace(")", "")
-        data = json.loads(data)
+        try:
+            data = json.loads(data)
+        except ValueError as e:
+            logging.error(f"Failed to parse textclick captcha payload: {e}")
+            return "", "", ""
         captcha_token = data["token"]
         vo = data.get("imageVerificationVo", {})
         
@@ -505,13 +635,26 @@ class reserve:
             "d": "a",
             "b": "a",
         }
-        response = self.requests.get(url=url, params=params, headers=self.headers)
+        try:
+            response = self._get(
+                url=url,
+                params=params,
+                headers=self.headers,
+                request_name="slide captcha fetch",
+            )
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"Failed to fetch slide captcha data: {e}")
+            return "", "", ""
         content = response.text
 
         data = content.replace(
             "jQuery33107685004390294206_1716461324846(", ")"
         ).replace(")", "")
-        data = json.loads(data)
+        try:
+            data = json.loads(data)
+        except ValueError as e:
+            logging.error(f"Failed to parse slide captcha payload: {e}")
+            return "", "", ""
         captcha_token = data["token"]
         bg = data["imageVerificationVo"]["shadeImage"]
         tp = data["imageVerificationVo"]["cutoutImage"]
@@ -552,7 +695,13 @@ class reserve:
             for attempt in range(1, max_retries + 1):
                 started = _time.time()
                 try:
-                    resp = self.requests.get(url, headers=c_captcha_headers, timeout=timeout_s)
+                    resp = self._get(
+                        url,
+                        headers=c_captcha_headers,
+                        timeout=timeout_s,
+                        attempts=1,
+                        request_name=f"{label} image download",
+                    )
                     resp.raise_for_status()
                     elapsed = _time.time() - started
                     if elapsed > timeout_s:
@@ -716,10 +865,23 @@ class reserve:
         logging.info(f"submit enc: {parm['enc']}")
 
         # 按前端行为采用表单提交（POST body），并关闭证书验证以避免告警
-        html = self.requests.post(url=url, data=parm, verify=False).content.decode(
-            "utf-8"
-        )
-        data = json.loads(html)
+        try:
+            response = self._post(
+                url=url,
+                data=parm,
+                verify=False,
+                request_name="seat submit",
+            )
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"Seat submit request failed: {e}")
+            return False
+
+        html = response.content.decode("utf-8")
+        try:
+            data = json.loads(html)
+        except ValueError as e:
+            logging.error(f"Failed to parse seat submit response: {e}; body={html[:200]}")
+            return False
         self.submit_msg.append(times[0] + "~" + times[1] + ":  " + str(data))
         logging.info(data)
 
@@ -754,10 +916,23 @@ class reserve:
         }
         logging.info(f"[burst] submit parameter (before enc) {parm} ")
         parm["enc"] = verify_param(parm, value)
-        html = self.requests.post(url=self.submit_url, data=parm, verify=False).content.decode(
-            "utf-8"
-        )
-        data = json.loads(html)
+        try:
+            response = self._post(
+                url=self.submit_url,
+                data=parm,
+                verify=False,
+                request_name="[burst] seat submit",
+            )
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"[burst] Seat submit request failed: {e}")
+            return {"success": False, "msg": str(e)}
+
+        html = response.content.decode("utf-8")
+        try:
+            data = json.loads(html)
+        except ValueError as e:
+            logging.error(f"[burst] Failed to parse seat submit response: {e}; body={html[:200]}")
+            return {"success": False, "msg": "invalid submit response"}
         self.submit_msg.append(times[0] + "~" + times[1] + ":  " + str(data))
         logging.info(data)
         return data
