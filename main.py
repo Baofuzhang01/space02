@@ -5,6 +5,7 @@ import os
 import logging
 import datetime
 import threading
+import random
 from zoneinfo import ZoneInfo
 
 # 统一日志时间为北京时间，方便在 GitHub Actions 日志中查看
@@ -60,19 +61,51 @@ def _format_seat_number(seat_num: int) -> str:
     return f"{seat_num:03d}"
 
 
-SLEEPTIME = 0.1  # 每次抢座的间隔（减少到0.05秒以加快速度）
-ENDTIME = "06:00:40"  # 根据学校的预约座位时间+1min即可
+def _pick_random_fallback_seat(
+    base_seat_num: int,
+    used_seats: set[str] | None = None,
+) -> tuple[str, str]:
+    """生成补抢座位号。
 
+    - 当前座位号 >= 50: 在 [1, 当前座位号] 随机
+    - 当前座位号 < 50: 在 [0, 100] 随机
+    - 同一配置的补抢窗口内优先不重复抽已尝试过的座位
+    返回三位数字符串和区间说明。
+    """
+    if base_seat_num < 50:
+        candidates = list(range(0, 101))
+        source_range = "0-100"
+    else:
+        candidates = list(range(1, base_seat_num + 1))
+        source_range = f"1-{base_seat_num}"
+
+    if used_seats:
+        remaining = [
+            seat_num for seat_num in candidates
+            if _format_seat_number(seat_num) not in used_seats
+        ]
+        if remaining:
+            candidates = remaining
+
+    seat_num = random.choice(candidates)
+    return _format_seat_number(seat_num), source_range
+
+
+ENDTIME = "06:00:40"  # 根据学校的预约座位时间+40ms即可
+RESERVE_NEXT_DAY = False  # 预约明天而不是今天的
 ENABLE_SLIDER = False  # 是否有滑块验证（调试阶段先关闭）
 ENABLE_TEXTCLICK = False  # 是否有选字验证码（需要图灵云打码平台）
+
+
 MAX_ATTEMPT = 1
-RESERVE_NEXT_DAY = False  # 预约明天而不是今天的
+SLEEPTIME = 0.05  # 每次抢座的间隔（减少到0.05秒以加快速度）
 
 
 # 是否在每一轮主循环中都重新登录。
 # True：每一轮都会重新创建会话并登录（原有行为）；
 # False：每个账号只在第一次需要时登录一次，后续循环复用同一个会话。
 RELOGIN_EVERY_LOOP = True
+MAX_SEAT_INCREMENT_ATTEMPTS = 4
 
 
 def _normalize_times(times):
@@ -296,6 +329,8 @@ def strategic_first_attempt(
 
     current_dayofweek = get_current_dayofweek(action)
     warm_done = False
+    shared_strategy_session = None
+    shared_strategy_username = None
 
     for index, user in enumerate(users):
         # 已经成功的配置不再参与策略尝试
@@ -340,181 +375,201 @@ def strategic_first_attempt(
             f"[strategic] Start first attempt for {username} -- {times} -- {seat_list} -- seatPageId={seat_page_id} -- fidEnc={fid_enc}"
         )
 
-        # 1. 在 [T-30s, T] 区间内完成登录和基础 session（不提前获取页面 token）
-        s = reserve(
-            sleep_time=SLEEPTIME,
-            max_attempt=MAX_ATTEMPT,
-            enable_slider=ENABLE_SLIDER,
-            enable_textclick=ENABLE_TEXTCLICK,
-            reserve_next_day=RESERVE_NEXT_DAY,
-        )
-        login_deadline = _get_strategy_login_deadline(target_dt)
-        login_ok = False
-        while _beijing_now() < login_deadline:
-            # 战略阶段把“多次小步快跑”放到外层 deadline 循环里，
-            # 避免单次 bootstrap 的内部重试把整个首发窗口吃光。
-            if s.bootstrap_login(username, password, attempts=1):
-                login_ok = True
-                break
-
-            remaining_login_s = (login_deadline - _beijing_now()).total_seconds()
-            if remaining_login_s <= 0:
-                break
-
-            logging.warning(
-                f"[strategic] Login bootstrap failed for {username}, "
-                f"retry within strategic window for {remaining_login_s:.2f}s more"
+        first_seat = seat_list[0]
+        captcha1 = captcha2 = captcha3 = ""
+        is_primary_strategy_config = shared_strategy_session is None
+        if is_primary_strategy_config:
+            # 1. 只有首个配置执行登录和预热；后续配置直接复用这个登录态。
+            s = reserve(
+                sleep_time=SLEEPTIME,
+                max_attempt=MAX_ATTEMPT,
+                enable_slider=ENABLE_SLIDER,
+                enable_textclick=ENABLE_TEXTCLICK,
+                reserve_next_day=RESERVE_NEXT_DAY,
             )
-            time.sleep(min(0.2, remaining_login_s))
+            login_deadline = _get_strategy_login_deadline(target_dt)
+            login_ok = False
+            while _beijing_now() < login_deadline:
+                if s.bootstrap_login(username, password, attempts=1):
+                    login_ok = True
+                    break
 
-        if not login_ok:
-            logging.warning(
-                f"[strategic] Skip first attempt for {username}: login bootstrap failed "
-                f"until strategic deadline {login_deadline}"
-            )
-            continue
+                remaining_login_s = (login_deadline - _beijing_now()).total_seconds()
+                if remaining_login_s <= 0:
+                    break
 
-        if _beijing_now() >= target_dt:
-            logging.warning(
-                f"[strategic] Login for {username} recovered after target time; "
-                "continue strategic submits with reduced preheat budget"
+                logging.warning(
+                    f"[strategic] Login bootstrap failed for {username}, "
+                    f"retry within strategic window for {remaining_login_s:.2f}s more"
+                )
+                time.sleep(min(0.2, remaining_login_s))
+
+            if not login_ok:
+                logging.warning(
+                    f"[strategic] Skip first attempt for {username}: login bootstrap failed "
+                    f"until strategic deadline {login_deadline}"
+                )
+                continue
+
+            if _beijing_now() >= target_dt:
+                logging.warning(
+                    f"[strategic] Login for {username} recovered after target time; "
+                    "continue strategic submits with reduced preheat budget"
+                )
+
+            shared_strategy_session = s
+            shared_strategy_username = username
+
+            # 验证码预热整体预算：最多占用 [T-slider_lead_seconds, T] 这段时间。
+            # 到达 target_dt 后立即停止预热，直接进入提交流程。
+            captcha_deadline = target_dt
+
+            def _remaining_captcha_seconds() -> float:
+                return (captcha_deadline - _beijing_now()).total_seconds()
+
+            # 2. 等到“目标时间前若干秒”，预热滑块验证码，提前拿到多份 validate（如果启用了滑块）
+            if ENABLE_SLIDER or ENABLE_TEXTCLICK:
+                ten_before = target_dt - datetime.timedelta(seconds=STRATEGY_SLIDER_LEAD_SECONDS)
+                while _beijing_now() < ten_before:
+                    time.sleep(0.1)
+
+            if ENABLE_SLIDER:
+                def _resolve_slide_captcha_parallel(slot_idx: int) -> str:
+                    if _remaining_captcha_seconds() <= 0:
+                        logging.warning(
+                            f"[strategic] Slider captcha{slot_idx} skipped: preheat deadline reached"
+                        )
+                        return ""
+
+                    worker = reserve(
+                        sleep_time=SLEEPTIME,
+                        max_attempt=MAX_ATTEMPT,
+                        enable_slider=ENABLE_SLIDER,
+                        enable_textclick=ENABLE_TEXTCLICK,
+                        reserve_next_day=RESERVE_NEXT_DAY,
+                    )
+                    worker.requests.cookies.update(s.requests.cookies)
+                    worker.requests.headers.update(s.requests.headers)
+
+                    captcha = worker.resolve_captcha("slide")
+                    if not captcha:
+                        if _remaining_captcha_seconds() <= 0:
+                            logging.warning(
+                                f"[strategic] Slider captcha{slot_idx} retry skipped: preheat deadline reached"
+                            )
+                            return ""
+                        logging.warning(
+                            f"[strategic] Slider captcha{slot_idx} failed or empty, retrying once more"
+                        )
+                        captcha = worker.resolve_captcha("slide")
+                    return captcha
+
+                captcha_results = {1: "", 2: "", 3: ""}
+                remaining = _remaining_captcha_seconds()
+                if remaining <= 0:
+                    logging.warning("[strategic] Captcha preheat budget exhausted before slider starts, skip preheat")
+                else:
+                    def _worker(slot_idx: int):
+                        try:
+                            captcha_results[slot_idx] = _resolve_slide_captcha_parallel(slot_idx) or ""
+                        except Exception as e:
+                            logging.warning(f"[strategic] Slider captcha{slot_idx} thread failed: {e}")
+                            captcha_results[slot_idx] = ""
+
+                    deadline_mono = time.monotonic() + remaining
+
+                    def _start_threads(slot_ids: list[int]):
+                        local_threads = []
+                        for idx in slot_ids:
+                            t = threading.Thread(
+                                target=_worker,
+                                args=(idx,),
+                                name=f"slide-captcha-{idx}",
+                                daemon=True,
+                            )
+                            local_threads.append((idx, t))
+                            t.start()
+                        return local_threads
+
+                    def _join_threads_until_deadline(threads_to_join):
+                        for _, t in threads_to_join:
+                            timeout_left = deadline_mono - time.monotonic()
+                            if timeout_left <= 0:
+                                break
+                            t.join(timeout=timeout_left)
+
+                    if remaining < 3:
+                        logging.warning(
+                            "[strategic] Remaining captcha preheat budget < 3s, preheat slot1/slot2 first"
+                        )
+                        first_two_threads = _start_threads([1, 2])
+                        _join_threads_until_deadline(first_two_threads)
+
+                        ready_count = sum(1 for i in [1, 2] if captcha_results[i])
+                        if ready_count >= 1:
+                            logging.warning(
+                                "[strategic] Budget < 3s and captcha1/2 already ready, skip captcha3 preheat"
+                            )
+                        else:
+                            timeout_left = deadline_mono - time.monotonic()
+                            if timeout_left > 0:
+                                logging.warning(
+                                    "[strategic] Budget < 3s and captcha1/2 empty, try captcha3 as fallback"
+                                )
+                                third_threads = _start_threads([3])
+                                _join_threads_until_deadline(third_threads)
+                    else:
+                        all_threads = _start_threads([1, 2, 3])
+                        _join_threads_until_deadline(all_threads)
+
+                captcha1 = captcha_results[1]
+                captcha2 = captcha_results[2]
+                captcha3 = captcha_results[3]
+                logging.info(f"[strategic] Pre-resolved slider captcha1: {captcha1}")
+                logging.info(f"[strategic] Pre-resolved slider captcha2: {captcha2}")
+                logging.info(f"[strategic] Pre-resolved slider captcha3: {captcha3}")
+            elif ENABLE_TEXTCLICK:
+                def get_textclick_with_retry(name: str, max_retries: int = 10) -> str:
+                    for i in range(max_retries):
+                        if _remaining_captcha_seconds() <= 0:
+                            logging.warning(f"[strategic] {name} textclick skipped: preheat deadline reached")
+                            return ""
+                        captcha = s.resolve_captcha("textclick")
+                        if captcha:
+                            logging.info(f"[strategic] {name} textclick captcha resolved: {captcha}")
+                            return captcha
+                        logging.warning(f"[strategic] {name} textclick captcha failed, retrying ({i + 1}/{max_retries})")
+                        time.sleep(0.5)
+                    logging.error(f"[strategic] {name} textclick captcha failed after {max_retries} retries")
+                    return ""
+
+                captcha1 = get_textclick_with_retry("First")
+                captcha2 = get_textclick_with_retry("Second")
+        else:
+            s = shared_strategy_session
+            s.requests.headers.update({"Host": "office.chaoxing.com"})
+            logging.info(
+                f"[strategic] Reuse preheated session from {shared_strategy_username} for {username}; "
+                "skip login and captcha preheat"
             )
+            if ENABLE_SLIDER:
+                logging.info(
+                    "[strategic] Captcha preheat skipped for this config; resolve slide captchas on demand"
+                )
+                captcha1 = s.resolve_captcha("slide") or ""
+                captcha2 = s.resolve_captcha("slide") or ""
+                captcha3 = s.resolve_captcha("slide") or ""
+            elif ENABLE_TEXTCLICK:
+                logging.info(
+                    "[strategic] Captcha preheat skipped for this config; resolve textclick captchas on demand"
+                )
+                captcha1 = s.resolve_captcha("textclick") or ""
+                captcha2 = s.resolve_captcha("textclick") or ""
+                captcha3 = s.resolve_captcha("textclick") or ""
+
         # 将已登录的 session 存入 sessions[]，fallback 直接复用，无需重新登录
         if sessions is not None and sessions[index] is None:
             sessions[index] = s
-
-        first_seat = seat_list[0]
-
-        captcha1 = captcha2 = captcha3 = ""
-
-        # 验证码预热整体预算：最多占用 [T-slider_lead_seconds, T] 这段时间。
-        # 到达 target_dt 后立即停止预热，直接进入提交流程。
-        captcha_deadline = target_dt
-
-        def _remaining_captcha_seconds() -> float:
-            return (captcha_deadline - _beijing_now()).total_seconds()
-
-        # 2. 等到“目标时间前若干秒”，预热滑块验证码，提前拿到多份 validate（如果启用了滑块）
-        if ENABLE_SLIDER or ENABLE_TEXTCLICK:
-            ten_before = target_dt - datetime.timedelta(seconds=STRATEGY_SLIDER_LEAD_SECONDS)
-            while _beijing_now() < ten_before:
-                time.sleep(0.1)
-
-        # 根据开关决定是否预热验证码
-        if ENABLE_SLIDER:
-            # 滑块验证：并发预取三份 validate，避免串行慢请求拖垮总时长
-            def _resolve_slide_captcha_parallel(slot_idx: int) -> str:
-                if _remaining_captcha_seconds() <= 0:
-                    logging.warning(
-                        f"[strategic] Slider captcha{slot_idx} skipped: preheat deadline reached"
-                    )
-                    return ""
-
-                worker = reserve(
-                    sleep_time=SLEEPTIME,
-                    max_attempt=MAX_ATTEMPT,
-                    enable_slider=ENABLE_SLIDER,
-                    enable_textclick=ENABLE_TEXTCLICK,
-                    reserve_next_day=RESERVE_NEXT_DAY,
-                )
-                worker.requests.cookies.update(s.requests.cookies)
-                worker.requests.headers.update(s.requests.headers)
-
-                captcha = worker.resolve_captcha("slide")
-                if not captcha:
-                    if _remaining_captcha_seconds() <= 0:
-                        logging.warning(
-                            f"[strategic] Slider captcha{slot_idx} retry skipped: preheat deadline reached"
-                        )
-                        return ""
-                    logging.warning(
-                        f"[strategic] Slider captcha{slot_idx} failed or empty, retrying once more"
-                    )
-                    captcha = worker.resolve_captcha("slide")
-                return captcha
-
-            captcha_results = {1: "", 2: "", 3: ""}
-            remaining = _remaining_captcha_seconds()
-            if remaining <= 0:
-                logging.warning("[strategic] Captcha preheat budget exhausted before slider starts, skip preheat")
-            else:
-                def _worker(slot_idx: int):
-                    try:
-                        captcha_results[slot_idx] = _resolve_slide_captcha_parallel(slot_idx) or ""
-                    except Exception as e:
-                        logging.warning(f"[strategic] Slider captcha{slot_idx} thread failed: {e}")
-                        captcha_results[slot_idx] = ""
-
-                deadline_mono = time.monotonic() + remaining
-
-                def _start_threads(slot_ids: list[int]):
-                    local_threads = []
-                    for idx in slot_ids:
-                        t = threading.Thread(
-                            target=_worker,
-                            args=(idx,),
-                            name=f"slide-captcha-{idx}",
-                            daemon=True,
-                        )
-                        local_threads.append((idx, t))
-                        t.start()
-                    return local_threads
-
-                def _join_threads_until_deadline(threads_to_join):
-                    for _, t in threads_to_join:
-                        timeout_left = deadline_mono - time.monotonic()
-                        if timeout_left <= 0:
-                            break
-                        t.join(timeout=timeout_left)
-
-                if remaining < 3:
-                    logging.warning(
-                        "[strategic] Remaining captcha preheat budget < 3s, preheat slot1/slot2 first"
-                    )
-                    first_two_threads = _start_threads([1, 2])
-                    _join_threads_until_deadline(first_two_threads)
-
-                    ready_count = sum(1 for i in [1, 2] if captcha_results[i])
-                    if ready_count >= 1:
-                        logging.warning(
-                            "[strategic] Budget < 3s and captcha1/2 already ready, skip captcha3 preheat"
-                        )
-                    else:
-                        timeout_left = deadline_mono - time.monotonic()
-                        if timeout_left > 0:
-                            logging.warning(
-                                "[strategic] Budget < 3s and captcha1/2 empty, try captcha3 as fallback"
-                            )
-                            third_threads = _start_threads([3])
-                            _join_threads_until_deadline(third_threads)
-                else:
-                    all_threads = _start_threads([1, 2, 3])
-                    _join_threads_until_deadline(all_threads)
-
-            captcha1 = captcha_results[1]
-            captcha2 = captcha_results[2]
-            captcha3 = captcha_results[3]
-            logging.info(f"[strategic] Pre-resolved slider captcha1: {captcha1}")
-            logging.info(f"[strategic] Pre-resolved slider captcha2: {captcha2}")
-            logging.info(f"[strategic] Pre-resolved slider captcha3: {captcha3}")
-        elif ENABLE_TEXTCLICK:
-            # 选字验证：预先获取三份 validate（循环重试直到成功）
-            def get_textclick_with_retry(name: str, max_retries: int = 10) -> str:
-                for i in range(max_retries):
-                    if _remaining_captcha_seconds() <= 0:
-                        logging.warning(f"[strategic] {name} textclick skipped: preheat deadline reached")
-                        return ""
-                    captcha = s.resolve_captcha("textclick")
-                    if captcha:
-                        logging.info(f"[strategic] {name} textclick captcha resolved: {captcha}")
-                        return captcha
-                    logging.warning(f"[strategic] {name} textclick captcha failed, retrying ({i + 1}/{max_retries})")
-                    time.sleep(0.5)
-                logging.error(f"[strategic] {name} textclick captcha failed after {max_retries} retries")
-                return ""
-
-            captcha1 = get_textclick_with_retry("First")
-            captcha2 = get_textclick_with_retry("Second")
 
         # token URL 供所有 3 次提交复用
         # 使用当天日期获取页面 token，避免预约日尚未开放导致页面报错拿不到 submit_enc
@@ -526,8 +581,8 @@ def strategic_first_attempt(
             fidEnc=fid_enc or "",
         )
 
-        # 连接预热：整个策略流程仅执行一次，避免多配置下重复 warm 请求
-        if not warm_done:
+        # 连接预热：只有首个配置执行一次，后续配置直接复用已预热的连接池
+        if is_primary_strategy_config and not warm_done:
             if _beijing_now() >= target_dt:
                 logging.info("[warm] Skip warm-up because target time reached, enter submit flow directly")
             else:
@@ -536,6 +591,8 @@ def strategic_first_attempt(
                     time.sleep(0.05)
                 s.warm_connection(_token_url)
                 warm_done = True
+        elif not is_primary_strategy_config:
+            logging.info("[warm] Reuse existing pre-warmed connection for this config")
         else:
             logging.info("[warm] Skip redundant warm-up for this config")
 
@@ -710,6 +767,12 @@ def strategic_first_attempt(
 
             # 如果第一次没有成功：为第二次提交重新获取页面 token，再延迟 TARGET_OFFSET2_MS 毫秒提交
             if not suc:
+                if s.should_skip_followup_submit():
+                    logging.info(
+                        "[strategic] First submit hit terminal failure msg, skip second/third submit"
+                    )
+                    success_list[index] = suc
+                    continue
                 logging.info("[strategic] First submit failed, prepare second submit with NEW page token")
 
                 token2, value2 = s._get_page_token(_token_url, require_value=True)
@@ -735,6 +798,12 @@ def strategic_first_attempt(
 
             # 如果第二次仍未成功：为第三次提交再次获取新的 token，再延迟 TARGET_OFFSET3_MS 毫秒提交
             if not suc:
+                if s.should_skip_followup_submit():
+                    logging.info(
+                        "[strategic] Second submit hit terminal failure msg, skip third submit"
+                    )
+                    success_list[index] = suc
+                    continue
                 logging.info("[strategic] Second submit failed, prepare third submit with NEW page token")
 
                 token3, value3 = s._get_page_token(_token_url, require_value=True)
@@ -914,7 +983,8 @@ def main(users, action=False):
                 f"[seat-increment] Invalid seatid {raw_sid}, skip auto-increment for this config"
             )
             original_seatids.append(None)
-    seat_offset = 0
+    seat_increment_attempts = 0
+    fallback_used_seats = [set() for _ in users]
 
     while True:
         # 使用逻辑时间 _now(action)，在 GitHub Actions 下就是北京时间
@@ -933,17 +1003,21 @@ def main(users, action=False):
             )
             strategic_done = True
 
-            # 预热三次结束后，如果仍有配置未成功，自动递增座位号并立即继续尝试
+            # 预热三次结束后，如果仍有配置未成功，随机补位并立即继续尝试
             if success_list is not None and sum(success_list) < today_reservation_num:
-                seat_offset = 1
+                seat_increment_attempts = 1
                 for i, user in enumerate(users):
                     if not success_list[i] and original_seatids[i] is not None \
                             and current_dayofweek in user.get("daysofweek", []):
-                        new_seat = _format_seat_number(original_seatids[i] + seat_offset)
+                        new_seat, source_range = _pick_random_fallback_seat(
+                            original_seatids[i], fallback_used_seats[i]
+                        )
+                        fallback_used_seats[i].add(new_seat)
                         user["seatid"] = [new_seat]
                         logging.info(
-                            f"[seat-increment-after-strategic] Config {i}: try seat {new_seat} "
-                            f"(base {original_seatids[i]} + offset {seat_offset})"
+                            f"[seat-random-after-strategic] Config {i}: try seat {new_seat} "
+                            f"(base {original_seatids[i]}, random range {source_range}, "
+                            f"attempt {seat_increment_attempts}/{MAX_SEAT_INCREMENT_ATTEMPTS})"
                         )
                 # 递增座位后立即调用 login_and_reserve（每个座位只试一次）
                 MAX_ATTEMPT = 1
@@ -955,20 +1029,34 @@ def main(users, action=False):
                     users, usernames, passwords, action, success_list, sessions
                 )
         else:
-            # 预热结束后仍未成功：未成功配置按座位号 +1 继续尝试（每轮 +1）
+            # 预热结束后仍未成功：未成功配置继续随机补位尝试
             if success_list is not None and sum(success_list) < today_reservation_num:
-                seat_offset += 1
+                if seat_increment_attempts >= MAX_SEAT_INCREMENT_ATTEMPTS:
+                    logging.info(
+                        f"[seat-random] Reached max fallback attempts "
+                        f"{MAX_SEAT_INCREMENT_ATTEMPTS}, stop fallback seat changes"
+                    )
+                    print(
+                        f"random fallback stopped after {seat_increment_attempts} attempts, "
+                        f"success list {success_list}"
+                    )
+                    return
+                seat_increment_attempts += 1
                 for i, user in enumerate(users):
                     if not success_list[i] and original_seatids[i] is not None \
                             and current_dayofweek in user.get("daysofweek", []):
-                        new_seat = _format_seat_number(original_seatids[i] + seat_offset)
+                        new_seat, source_range = _pick_random_fallback_seat(
+                            original_seatids[i], fallback_used_seats[i]
+                        )
+                        fallback_used_seats[i].add(new_seat)
                         user["seatid"] = [new_seat]
                         logging.info(
-                            f"[seat-increment] Config {i}: try seat {new_seat} "
-                            f"(base {original_seatids[i]} + offset {seat_offset})"
+                            f"[seat-random] Config {i}: try seat {new_seat} "
+                            f"(base {original_seatids[i]}, random range {source_range}, "
+                            f"attempt {seat_increment_attempts}/{MAX_SEAT_INCREMENT_ATTEMPTS})"
                         )
 
-                # 递增模式下每个座位只提交一次，失败就下一轮换座位
+                # 随机补位模式下每个座位只提交一次，失败就下一轮重新随机
                 MAX_ATTEMPT = 1
                 if sessions is not None:
                     for s_obj in sessions:

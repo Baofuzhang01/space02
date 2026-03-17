@@ -88,6 +88,7 @@ class reserve:
         self.success_times = 0
         self.fail_dict = []
         self.submit_msg = []
+        self.last_submit_result = None
         self.requests = requests.session()
         self.request_timeout = (
             float(os.getenv("CX_CONNECT_TIMEOUT", "3.05")),
@@ -127,6 +128,16 @@ class reserve:
         self.enable_textclick = enable_textclick
         self.reserve_next_day = reserve_next_day
         requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+    @staticmethod
+    def _is_terminal_submit_failure(msg: str) -> bool:
+        return "已有预约" in msg or "已被占用" in msg
+
+    def should_skip_followup_submit(self) -> bool:
+        if not isinstance(self.last_submit_result, dict):
+            return False
+        msg = str(self.last_submit_result.get("msg", ""))
+        return self._is_terminal_submit_failure(msg)
 
     def _request_with_retry(
         self,
@@ -882,6 +893,7 @@ class reserve:
         except ValueError as e:
             logging.error(f"Failed to parse seat submit response: {e}; body={html[:200]}")
             return False
+        self.last_submit_result = data
         self.submit_msg.append(times[0] + "~" + times[1] + ":  " + str(data))
         logging.info(data)
 
@@ -933,6 +945,7 @@ class reserve:
         except ValueError as e:
             logging.error(f"[burst] Failed to parse seat submit response: {e}; body={html[:200]}")
             return {"success": False, "msg": "invalid submit response"}
+        self.last_submit_result = data
         self.submit_msg.append(times[0] + "~" + times[1] + ":  " + str(data))
         logging.info(data)
         return data
