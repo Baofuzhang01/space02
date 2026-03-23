@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      max-parallel: 20
+      max-parallel: 10
       matrix:
         user: ${{ fromJson(needs.prepare-dispatch.outputs.users_matrix) }}
 
