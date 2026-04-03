@@ -143,18 +143,18 @@ jobs:
 
   forward-dispatch:
     name: forward-dispatch-to-server
-    if: ${{ github.event_name == 'repository_dispatch' && (needs.prepare-dispatch.outputs.dispatch_target == 'server_relay' || needs.prepare-dispatch.outputs.dispatch_target == 'both') }}
+    if: ${{ github.event_name == 'repository_dispatch' && needs.prepare-dispatch.outputs.dispatch_target == 'server_relay' }}
     needs: prepare-dispatch
     runs-on: ubuntu-latest
 
     steps:
       - name: Forward dispatch payload to server
-        env:
-          SERVER_DISPATCH_URL: ${{ secrets.SERVER_DISPATCH_URL }}
-          SERVER_DISPATCH_API_KEY: ${{ secrets.SERVER_DISPATCH_API_KEY }}
         run: |
-          if [[ -z "$SERVER_DISPATCH_URL" ]]; then
-            echo "SERVER_DISPATCH_URL secret is required"
+          dispatch_url="$(jq -r '.client_payload.server_url // ""' "$GITHUB_EVENT_PATH")"
+          dispatch_api_key="$(jq -r '.client_payload.server_api_key // ""' "$GITHUB_EVENT_PATH")"
+
+          if [[ -z "$dispatch_url" ]]; then
+            echo "client_payload.server_url is required"
             exit 1
           fi
 
@@ -165,12 +165,12 @@ jobs:
           fi
 
           headers=(-H 'Content-Type: application/json')
-          if [[ -n "$SERVER_DISPATCH_API_KEY" ]]; then
-            headers+=(-H "X-API-Key: $SERVER_DISPATCH_API_KEY")
+          if [[ -n "$dispatch_api_key" ]]; then
+            headers+=(-H "X-API-Key: $dispatch_api_key")
           fi
 
           http_code="$(curl -sS -o /tmp/server_dispatch_resp.txt -w '%{http_code}' \
-            -X POST "$SERVER_DISPATCH_URL" \
+            -X POST "$dispatch_url" \
             "${headers[@]}" \
             --data "$payload")"
 
@@ -181,7 +181,7 @@ jobs:
           {
             echo "### 服务器中转结果"
             echo
-            echo "- Dispatch URL: ${SERVER_DISPATCH_URL}"
+            echo "- Dispatch URL: ${dispatch_url}"
             echo "- HTTP Status: ${http_code}"
             echo
             echo '```json'
