@@ -260,6 +260,50 @@ def parse_literal_dict(text: str) -> dict | None:
     return obj if isinstance(obj, dict) else None
 
 
+def extract_seat_reserve(result: Any) -> dict:
+    if not isinstance(result, dict):
+        return {}
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return {}
+    seat_reserve = data.get("seatReserve")
+    return seat_reserve if isinstance(seat_reserve, dict) else {}
+
+
+def success_seat_from_attempt(attempt: dict) -> str:
+    result = attempt.get("result") if isinstance(attempt.get("result"), dict) else {}
+    if result.get("success") is not True:
+        return ""
+    seat_reserve = extract_seat_reserve(result)
+    return normalize_text(seat_reserve.get("seatNum") or attempt.get("seatNum"), 80)
+
+
+def success_room_from_attempt(attempt: dict) -> str:
+    result = attempt.get("result") if isinstance(attempt.get("result"), dict) else {}
+    if result.get("success") is not True:
+        return ""
+    seat_reserve = extract_seat_reserve(result)
+    return normalize_text(seat_reserve.get("roomId") or attempt.get("roomId"), 80)
+
+
+def success_day_from_attempt(attempt: dict) -> str:
+    result = attempt.get("result") if isinstance(attempt.get("result"), dict) else {}
+    if result.get("success") is not True:
+        return ""
+    seat_reserve = extract_seat_reserve(result)
+    return normalize_text(seat_reserve.get("today") or attempt.get("day"), 32)
+
+
+def success_location_from_attempt(attempt: dict) -> dict:
+    result = attempt.get("result") if isinstance(attempt.get("result"), dict) else {}
+    seat_reserve = extract_seat_reserve(result)
+    return {
+        "firstLevelName": normalize_text(seat_reserve.get("firstLevelName"), 120),
+        "secondLevelName": normalize_text(seat_reserve.get("secondLevelName"), 120),
+        "thirdLevelName": normalize_text(seat_reserve.get("thirdLevelName"), 120),
+    }
+
+
 def extract_submit_attempts(log_text: str) -> list[dict]:
     attempts: list[dict] = []
     current: dict | None = None
@@ -295,6 +339,15 @@ def extract_submit_attempts(log_text: str) -> list[dict]:
             result = parse_literal_dict(stripped)
             if result is not None:
                 current["result"] = result
+                if result.get("success") is True:
+                    seat_reserve = extract_seat_reserve(result)
+                    if seat_reserve:
+                        current["actualRoomId"] = normalize_text(seat_reserve.get("roomId"), 80)
+                        current["actualSeatNum"] = normalize_text(seat_reserve.get("seatNum"), 80)
+                        current["actualDay"] = normalize_text(seat_reserve.get("today"), 32)
+                        current["firstLevelName"] = normalize_text(seat_reserve.get("firstLevelName"), 120)
+                        current["secondLevelName"] = normalize_text(seat_reserve.get("secondLevelName"), 120)
+                        current["thirdLevelName"] = normalize_text(seat_reserve.get("thirdLevelName"), 120)
     return attempts
 
 
@@ -375,6 +428,53 @@ def extract_admin_timeline(log_text: str) -> list[dict]:
     return timeline[-80:]
 
 
+def extract_first_primary_conflict(log_text: str) -> dict:
+    """只提取首抢提交前的查座冲突；没有冲突时返回空。"""
+    last_response: dict = {}
+    for line in log_text.splitlines():
+        if "submit parameter resolved" in line:
+            break
+
+        if "seat getusedtimes response:" in line:
+            response_text = line.split("seat getusedtimes response:", 1)[1].strip()
+            parsed_response = parse_literal_dict(response_text) or {}
+            last_response = {
+                "time": extract_log_timestamp(line),
+                "data": parsed_response.get("data") if isinstance(parsed_response, dict) else None,
+                "message": sanitize_admin_log_line(line),
+            }
+            continue
+
+        if "seat getusedtimes conflict check:" not in line or "conflict=True" not in line:
+            continue
+
+        text = strip_log_prefix(line)
+        seat_match = re.search(r"seat=([^,\s]+)", text)
+        requested_match = re.search(r"requested=([^,]+)", text)
+        used_match = re.search(r"used=(\[[^\]]*\])", text)
+        conflict_intervals_match = re.search(r"conflict_intervals=(\[[^\]]*\])", text)
+        checked_at = last_response.get("time") or extract_log_timestamp(line)
+        seat = normalize_text(seat_match.group(1) if seat_match else "", 80)
+        requested = normalize_text(requested_match.group(1) if requested_match else "", 120)
+        used_text = normalize_text(used_match.group(1) if used_match else "", 300)
+        conflict_intervals = normalize_text(
+            conflict_intervals_match.group(1) if conflict_intervals_match else "",
+            300,
+        )
+        return {
+            "conflict": True,
+            "checkedAt": checked_at,
+            "seat": seat,
+            "requested": requested,
+            "used": used_text,
+            "conflictIntervals": conflict_intervals,
+            "responseData": last_response.get("data"),
+            "message": f"首抢座位{seat or '未识别'}在 {checked_at or '未知时间'} 查座时已被其它用户占用",
+        }
+
+    return {}
+
+
 def format_admin_timeline(timeline: list[dict]) -> str:
     if not timeline:
         return ""
@@ -449,6 +549,7 @@ def build_result(run_dir: pathlib.Path, summary: dict, payload: dict, item: dict
     log_text = read_log(log_path)
     attempts = extract_submit_attempts(log_text)
     admin_timeline = extract_admin_timeline(log_text)
+    first_primary_conflict = extract_first_primary_conflict(log_text)
     success_attempt = next(
         (
             attempt
@@ -468,10 +569,12 @@ def build_result(run_dir: pathlib.Path, summary: dict, payload: dict, item: dict
         for attempt in attempts
         if isinstance(attempt.get("result"), dict) and attempt["result"].get("success") is True
     ]
-    final_seat = unique_join([normalize_text(attempt.get("seatNum"), 80) for attempt in successful_attempts])
+    final_seat = unique_join([success_seat_from_attempt(attempt) for attempt in successful_attempts])
     if not final_seat:
-        final_seat = normalize_text((success_attempt or {}).get("seatNum"), 80)
-    reserve_date = normalize_text((success_attempt or {}).get("day"), 32)
+        final_seat = success_seat_from_attempt(success_attempt or {})
+    reserve_date = success_day_from_attempt(success_attempt or {})
+    if not reserve_date:
+        reserve_date = normalize_text((success_attempt or {}).get("day"), 32)
     if not reserve_date and attempts:
         reserve_date = normalize_text(attempts[0].get("day"), 32)
     if not reserve_date:
@@ -488,12 +591,15 @@ def build_result(run_dir: pathlib.Path, summary: dict, payload: dict, item: dict
     for attempt in attempts:
         slot = match_user_slot(user_slots, attempt)
         result = attempt.get("result") if isinstance(attempt.get("result"), dict) else {}
-        seat = normalize_text(attempt.get("seatNum"), 80)
+        attempt_seat = normalize_text(attempt.get("seatNum"), 80)
         primary_seats = slot.get("primary") or []
         backup_seats = slot.get("backup") or []
         success = bool(result.get("success") is True)
         message = normalize_text(result.get("msg") if isinstance(result, dict) else "", 240)
-        source = "primary" if seat and seat in primary_seats else "backup" if seat and seat in backup_seats else "unknown"
+        final_attempt_seat = success_seat_from_attempt(attempt) if success else ""
+        source_seat = final_attempt_seat if success else attempt_seat
+        source = "primary" if source_seat and source_seat in primary_seats else "backup" if source_seat and source_seat in backup_seats else "unknown"
+        location = success_location_from_attempt(attempt) if success else {}
         if success:
             result_text = "首抢成功" if source == "primary" else "备选成功" if source == "backup" else "成功"
         else:
@@ -501,10 +607,15 @@ def build_result(run_dir: pathlib.Path, summary: dict, payload: dict, item: dict
         attempt_results.append(
             {
                 "time": normalize_text(attempt.get("time") or slot.get("time"), 80),
-                "primarySeat": unique_join(primary_seats) or seat,
+                "primarySeat": unique_join(primary_seats) or attempt_seat,
                 "backupSeat": unique_join(backup_seats),
-                "finalSeat": seat if success else "",
-                "attemptSeat": seat,
+                "finalSeat": final_attempt_seat,
+                "attemptSeat": attempt_seat,
+                "actualRoomId": success_room_from_attempt(attempt) if success else "",
+                "actualSeat": final_attempt_seat,
+                "firstLevelName": location.get("firstLevelName", ""),
+                "secondLevelName": location.get("secondLevelName", ""),
+                "thirdLevelName": location.get("thirdLevelName", ""),
                 "result": result_text,
                 "success": success,
                 "source": source,
@@ -555,6 +666,11 @@ def build_result(run_dir: pathlib.Path, summary: dict, payload: dict, item: dict
                 "backupSeat": unique_join(backup_seats),
                 "finalSeat": final_slot_seat,
                 "attemptSeat": normalize_text(final_detail.get("attemptSeat"), 80),
+                "actualRoomId": normalize_text(final_detail.get("actualRoomId"), 80),
+                "actualSeat": normalize_text(final_detail.get("actualSeat") or final_slot_seat, 80),
+                "firstLevelName": normalize_text(final_detail.get("firstLevelName"), 120),
+                "secondLevelName": normalize_text(final_detail.get("secondLevelName"), 120),
+                "thirdLevelName": normalize_text(final_detail.get("thirdLevelName"), 120),
                 "result": result_text,
                 "success": success,
                 "source": final_source,
@@ -641,6 +757,7 @@ def build_result(run_dir: pathlib.Path, summary: dict, payload: dict, item: dict
             "nickname": nickname,
             "time_slots": time_slot_results,
             "attempts": attempt_results[-40:],
+            "first_primary_conflict": first_primary_conflict,
             "configured_slots": [
                 {
                     "time": slot.get("time") or "",
