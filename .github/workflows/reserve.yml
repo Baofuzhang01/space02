@@ -201,7 +201,9 @@ jobs:
             exit 1
           fi
 
-          payload="$(jq -c '.client_payload' "$GITHUB_EVENT_PATH")"
+          # The API key is authentication metadata, not part of the reservation
+          # payload. Do not persist it in server_runs/*/payload.json.
+          payload="$(jq -c '.client_payload | del(.server_url, .server_api_key)' "$GITHUB_EVENT_PATH")"
           if [[ -z "$payload" || "$payload" == "null" ]]; then
             echo "client_payload missing from repository_dispatch event"
             exit 1
@@ -212,12 +214,27 @@ jobs:
             headers+=(-H "X-API-Key: $dispatch_api_key")
           fi
 
-          http_code="$(curl -sS -o /tmp/server_dispatch_resp.txt -w '%{http_code}' \
+          : > /tmp/server_dispatch_resp.txt
+          set +e
+          http_code="$(curl -sS --http1.1 \
+            --connect-timeout 14 \
+            --max-time 35 \
+            --retry 3 \
+            --retry-delay 2 \
+            --retry-max-time 150 \
+            --retry-all-errors \
+            -o /tmp/server_dispatch_resp.txt \
+            -w '%{http_code}' \
             -X POST "$dispatch_url" \
             "${headers[@]}" \
-            --data "$payload")"
+            --data-binary "$payload")"
+          curl_exit_code="$?"
+          set -e
+
+          http_code="${http_code:-000}"
 
           echo "Server dispatch HTTP status: ${http_code}"
+          echo "curl exit code: ${curl_exit_code}"
           echo "===== Server dispatch response ====="
           cat /tmp/server_dispatch_resp.txt || true
 
@@ -226,12 +243,19 @@ jobs:
             echo
             echo "- Dispatch URL: ${dispatch_url}"
             echo "- HTTP Status: ${http_code}"
+            echo "- curl exit code: ${curl_exit_code}"
             echo
             echo '```json'
             cat /tmp/server_dispatch_resp.txt
             echo
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$curl_exit_code" -ne 0 ]]; then
+            echo "Server dispatch transport failed after retries (curl exit ${curl_exit_code})." >&2
+            echo "Check the server-dispatch service, Nginx /dispatch proxy, firewall/security-group rules, and whether the URL scheme matches the listener (http vs https)." >&2
+            exit "$curl_exit_code"
+          fi
 
           if [[ ! "$http_code" =~ ^2 ]]; then
             exit 1
